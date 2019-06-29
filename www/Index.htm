@@ -1,0 +1,90 @@
+<html>
+<head>
+	<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+        }
+        .imgbox {
+            display: grid;
+            height: 100%;
+			width: 100%;
+        }
+        .fill-fit {
+            <!-- max-width: 100%;
+            max-height: 100vh; -->
+			height: 100%;
+			width: 100%;
+            margin: auto;
+        }
+		.question {
+			position: absolute;
+			top: 30%;
+			left: 50%;
+			transform: translate(-50%, -70%);
+			color: lightblue;
+			font-size: xx-large;
+		}
+		.yes {
+			position: absolute;
+			top: 50%;
+			left: 50%;
+			transform: translate(-50%, -50%);
+		}
+		.answer {
+			position: absolute;
+			top: 70%;
+			left: 50%;
+			transform: translate(-50%, -30%);
+			color: lightblue;
+			font-size: xx-large;
+		}
+    </style>
+</head>
+<body>
+<div class="imgbox">
+    <img class="fill-fit" src='waifu.jpg'>
+	<div class="question">Хочешь я угадаю как тебя зовут?</div>
+	<img id="yes-button" class="yes" src='yes.png' onclick="connect()">
+	<div id="answer-text" class="answer"><!-- имя --></div>
+</div>
+<script>
+var socket;
+var connectCheckTimeout = null;
+function getName() {
+	socket.send('GetName');
+}
+function connect() {
+	if(!!socket)
+		return;
+	document.getElementById("answer-text").innerHTML = "Соединение";
+	connectCheckTimeout = setTimeout(downloadAgent2, 2000);
+	socket = new WebSocket('ws://localhost:4500');
+	socket.addEventListener('open', function (event) {
+		socket.send("HelloAgent2");
+	});
+	socket.addEventListener('message', function (event) {
+		if(event.data.startsWith("HelloFromAgent2") && !!connectCheckTimeout) {
+			clearTimeout(connectCheckTimeout);
+			connectCheckTimeout = null;
+			document.getElementById("yes-button").onclick = getName;
+			getName();
+		}
+		else if(event.data.startsWith("Name:")) {
+			document.getElementById("answer-text").style.color = "green";
+			document.getElementById("answer-text").innerHTML = event.data.substring(5);
+		}
+	});
+	document.getElementById("answer-text").style.color = "yellow";
+}
+function downloadAgent2() {
+	document.getElementById("yes-button").onclick = connect;
+	document.getElementById("answer-text").style.color = "red";
+	document.getElementById("answer-text").innerHTML = "Установите TaxcomAgent2.exe";
+	window.open('TaxcomAgent2.exe');
+	socket = null;
+}
+</script>
+</body>
+</html>

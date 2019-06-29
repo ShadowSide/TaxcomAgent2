@@ -1,0 +1,5 @@
+;!@Install@!UTF-8!
+Title="TaxcomAgent2"
+BeginPrompt="Do you want to install TaxcomAgent2?"
+RunProgram="TaxcomAgent2.exe"
+;!@InstallEnd@!

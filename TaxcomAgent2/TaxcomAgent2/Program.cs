@@ -1,9 +1,15 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
+using vtortola.WebSockets;
+using vtortola.WebSockets.Deflate;
+using vtortola.WebSockets.Rfc6455;
+using WebSocket = vtortola.WebSockets.WebSocket;
 
 namespace TaxcomAgent2
 {
@@ -28,58 +34,140 @@ namespace TaxcomAgent2
         static async System.Threading.Tasks.Task Main(string[] args)
         {
             Console.WriteLine("TaxcomAgent2");
-            HttpListener httpListener = new HttpListener();
-            httpListener.Prefixes.Add("http://localhost:4500/");
-            httpListener.Start();
-            Console.WriteLine("Started!");
-            for (; ; )
+            /*var options = new WebSocketListenerOptions();
+            options.Standards.RegisterRfc6455();
+            var httpListener = new WebSocketListener(new IPEndPoint(IPAddress.Loopback, 4500), options);
+            await httpListener.StartAsync();*/
+
+            var cancellation = new CancellationTokenSource();
+
+            var bufferSize = 1024 * 8; // 8KiB
+            var bufferPoolSize = 100 * bufferSize; // 800KiB pool
+
+            var options = new WebSocketListenerOptions
             {
-                HttpListenerContext context = await httpListener.GetContextAsync();
-                if (context.Request.IsWebSocketRequest)
+                SubProtocols = new[] { "text" },
+                PingTimeout = TimeSpan.FromSeconds(5),
+                NegotiationTimeout = TimeSpan.FromSeconds(5),
+                PingMode = PingMode.Manual,
+                ParallelNegotiations = 16,
+                NegotiationQueueCapacity = 256,
+                BufferManager = BufferManager.CreateBufferManager(bufferPoolSize, bufferSize)
+            };
+            options.Standards.RegisterRfc6455(factory =>
+            {
+                factory.MessageExtensions.RegisterDeflateCompression();
+            });
+            // configure tcp transport
+            options.Transports.ConfigureTcp(tcp =>
+            {
+                tcp.BacklogSize = 100; // max pending connections waiting to be accepted
+                tcp.ReceiveBufferSize = bufferSize;
+                tcp.SendBufferSize = bufferSize;
+            });
+
+            // adding the WSS extension
+            //var certificate = new X509Certificate2(File.ReadAllBytes("<PATH-TO-CERTIFICATE>"), "<PASSWORD>");
+            // options.ConnectionExtensions.RegisterSecureConnection(certificate);
+
+            var listenEndPoints = new Uri[] {
+                new Uri("ws://localhost:4500/") // will listen both IPv4 and IPv6
+            };
+
+            // starting the server
+            var server = new WebSocketListener(listenEndPoints, options);
+
+            server.StartAsync().Wait();
+
+            Console.WriteLine("Started!");
+
+            var acceptingTask = AcceptWebSocketsAsync(server, cancellation.Token);
+
+            Console.WriteLine("Press any key to stop.");
+            Console.ReadKey(true);
+
+            Console.WriteLine("Server stopping.");
+            cancellation.Cancel();
+            server.StopAsync().Wait();
+            acceptingTask.Wait();
+        }
+
+        private static async Task AcceptWebSocketsAsync(WebSocketListener server, CancellationToken cancellation)
+        {
+            await Task.Yield();
+
+            while (!cancellation.IsCancellationRequested)
+            {
+                try
                 {
-                    HttpListenerWebSocketContext webSocketContext = await context.AcceptWebSocketAsync(null);
-                    WebSocket socket = webSocketContext.WebSocket;
-                    while (socket.State == WebSocketState.Open)
+                    var webSocket = await server.AcceptWebSocketAsync(cancellation).ConfigureAwait(false);
+                    if (webSocket == null)
                     {
-                        const int maxMessageSize = 4096;
-                        byte[] receiveBuffer = new byte[maxMessageSize];
-                        WebSocketReceiveResult receiveResult = await socket.ReceiveAsync(new ArraySegment<byte>(receiveBuffer), CancellationToken.None);
+                        if (cancellation.IsCancellationRequested || !server.IsStarted)
+                            break; // stopped
 
-                        if (receiveResult.MessageType == WebSocketMessageType.Close)
-                        {
-                            await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, string.Empty, CancellationToken.None);
-                        }
-                        else if (receiveResult.MessageType == WebSocketMessageType.Binary)
-                        {
-                            await socket.CloseAsync(WebSocketCloseStatus.InvalidMessageType, "Cannot accept binary frame", CancellationToken.None);
-                        }
-                        else
-                        {
-                            int count = receiveResult.Count;
+                        continue; // retry
+                    }
 
-                            while (receiveResult.EndOfMessage == false)
-                            {
-                                if (count >= maxMessageSize)
-                                {
-                                    string closeMessage = string.Format("Maximum message size: {0} bytes.", maxMessageSize);
-                                    await socket.CloseAsync(WebSocketCloseStatus.MessageTooBig, closeMessage, CancellationToken.None);
-                                    return;
-                                }
+#pragma warning disable 4014
+                    EchoAllIncomingMessagesAsync(webSocket, cancellation);
+#pragma warning restore 4014
+                }
+                catch (OperationCanceledException)
+                {
+                    /* server is stopped */
+                    break;
+                }
+                catch (Exception acceptError)
+                {
+                    Console.WriteLine("An error occurred while accepting client.", acceptError);
+                }
+            }
 
-                                receiveResult = await socket.ReceiveAsync(new ArraySegment<byte>(receiveBuffer, count, maxMessageSize - count), CancellationToken.None);
-                                count += receiveResult.Count;
-                            }
+            Console.WriteLine("Server has stopped accepting new clients.");
+        }
 
-                            var receivedString = Encoding.UTF8.GetString(receiveBuffer, 0, count);
-                            var echoString = WebSocketHandler(receivedString);
-                            ArraySegment<byte> outputBuffer = new ArraySegment<byte>(Encoding.UTF8.GetBytes(echoString));
+        private static async Task EchoAllIncomingMessagesAsync(WebSocket webSocket, CancellationToken cancellation)
+        {
+            Console.WriteLine("Client '" + webSocket.RemoteEndpoint + "' connected.");
+            var sw = new Stopwatch();
+            try
+            {
+                while (webSocket.IsConnected && !cancellation.IsCancellationRequested)
+                {
+                    try
+                    {
+                        var messageText = await webSocket.ReadStringAsync(cancellation).ConfigureAwait(false);
+                        if (messageText == null)
+                            break; // webSocket is disconnected
 
-                            await socket.SendAsync(outputBuffer, WebSocketMessageType.Text, true, CancellationToken.None);
-                        }
+                        Console.WriteLine("Client '" + webSocket.RemoteEndpoint + "' recived: " + messageText + ".");
+
+                        sw.Restart();
+
+                        messageText = WebSocketHandler(messageText);
+
+                        await webSocket.WriteStringAsync(messageText, cancellation).ConfigureAwait(false);
+
+                        Console.WriteLine("Client '" + webSocket.RemoteEndpoint + "' sent: " + messageText + ".");
+
+                        sw.Stop();
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        break;
+                    }
+                    catch (Exception readWriteError)
+                    {
+                        Console.WriteLine("An error occurred while reading/writing echo message.", readWriteError);
+                        await webSocket.CloseAsync().ConfigureAwait(false);
                     }
                 }
-                else
-                    context.Response.StatusCode = 400;
+            }
+            finally
+            {
+                webSocket.Dispose();
+                Console.WriteLine("Client '" + webSocket.RemoteEndpoint + "' disconnected.");
             }
         }
 
